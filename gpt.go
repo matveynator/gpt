@@ -11,8 +11,11 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"os/signal"
+	"runtime"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -20,7 +23,6 @@ import (
 // 1. Основные матричные операции и функции активации
 // =============================================================================
 
-// dotProduct вычисляет скалярное произведение двух векторов.
 func dotProduct(a, b []float64) float64 {
 	if len(a) != len(b) {
 		log.Fatalf("dotProduct: размеры векторов не совпадают: %d vs %d", len(a), len(b))
@@ -32,7 +34,6 @@ func dotProduct(a, b []float64) float64 {
 	return sum
 }
 
-// matMul выполняет умножение матрицы A (m×n) на матрицу B (n×p) и возвращает матрицу (m×p).
 func matMul(A, B [][]float64) [][]float64 {
 	m := len(A)
 	n := len(A[0])
@@ -51,7 +52,6 @@ func matMul(A, B [][]float64) [][]float64 {
 	return C
 }
 
-// matVecMul умножает матрицу A (m×n) на вектор x (n) и возвращает вектор размера m.
 func matVecMul(A [][]float64, x []float64) []float64 {
 	m := len(A)
 	n := len(A[0])
@@ -69,7 +69,6 @@ func matVecMul(A [][]float64, x []float64) []float64 {
 	return out
 }
 
-// addVec складывает два вектора одинаковой длины.
 func addVec(a, b []float64) []float64 {
 	if len(a) != len(b) {
 		log.Fatalf("addVec: длины векторов не совпадают: %d vs %d", len(a), len(b))
@@ -81,7 +80,6 @@ func addVec(a, b []float64) []float64 {
 	return out
 }
 
-// relu применяет ReLU активацию поэлементно.
 func relu(x []float64) []float64 {
 	out := make([]float64, len(x))
 	for i, v := range x {
@@ -94,7 +92,6 @@ func relu(x []float64) []float64 {
 	return out
 }
 
-// softmax вычисляет softmax для вектора (получаем распределение вероятностей).
 func softmax(x []float64) []float64 {
 	maxVal := x[0]
 	for _, v := range x {
@@ -122,6 +119,10 @@ func softmax(x []float64) []float64 {
 // =============================================================================
 
 // 2.1. Embedding: объединяет токенные и позиционные эмбеддинги.
+// Параметры:
+//   - VocabSize: количество уникальных символов
+//   - EmbedSize: размер эмбеддингов (больше → больше возможностей, но больше параметров)
+//   - MaxSeqLen: максимальная длина входной последовательности (контекст)
 type Embedding struct {
 	TokenEmbedding      [][]float64 // VocabSize x EmbedSize
 	PositionalEmbedding [][]float64 // MaxSeqLen x EmbedSize
@@ -147,10 +148,10 @@ func (e *Embedding) Apply(tokens []int) [][]float64 {
 	return out
 }
 
-// 2.2. LayerNorm: нормализует входной вектор.
+// 2.2. LayerNorm: нормализует входной вектор (стандартная техника для стабилизации обучения).
 type LayerNorm struct {
-	Gamma []float64 // Масштабирование
-	Beta  []float64 // Смещение
+	Gamma []float64 // Параметры масштабирования
+	Beta  []float64 // Параметры смещения
 	Eps   float64   // Для числовой стабильности
 }
 
@@ -183,12 +184,14 @@ func (ln *LayerNorm) Apply(x []float64) []float64 {
 	return out
 }
 
-// 2.3. Self-Attention (одноголовое)
+// 2.3. Self-Attention (одноголовое).
+// Основная идея – для каждого токена вычислить «запросы» (Q), «ключи» (K) и «значения» (V)
+// и затем вычислить взвешенную сумму V с весами, полученными через softmax(Q·K).
 type SelfAttention struct {
-	Wq [][]float64 // EmbedSize x EmbedSize
-	Wk [][]float64
-	Wv [][]float64
-	Wo [][]float64
+	Wq [][]float64 // Вес для запросов: EmbedSize x EmbedSize
+	Wk [][]float64 // Вес для ключей: EmbedSize x EmbedSize
+	Wv [][]float64 // Вес для значений: EmbedSize x EmbedSize
+	Wo [][]float64 // Вес для объединения: EmbedSize x EmbedSize
 }
 
 func NewSelfAttention(embedSize int) *SelfAttention {
@@ -233,12 +236,14 @@ func (sa *SelfAttention) Apply(x [][]float64) [][]float64 {
 	return out
 }
 
-// 2.4. MLP-блок: двухслойный перцептрон с ReLU.
+// 2.4. MLP-блок: двухслойный перцептрон с активацией ReLU.
+// Параметры:
+//   - MLPDim: размер скрытого слоя; увеличение этого значения может улучшить качество, но увеличивает число параметров.
 type MLP struct {
-	W1 [][]float64 // MLPDim x EmbedSize
-	B1 []float64   // MLPDim
-	W2 [][]float64 // EmbedSize x MLPDim
-	B2 []float64   // EmbedSize
+	W1 [][]float64 // Первый линейный слой: MLPDim x EmbedSize
+	B1 []float64   // Смещения первого слоя: MLPDim
+	W2 [][]float64 // Второй линейный слой: EmbedSize x MLPDim
+	B2 []float64   // Смещения второго слоя: EmbedSize
 }
 
 func NewMLP(embedSize, mlpDim int) *MLP {
@@ -262,7 +267,7 @@ func (mlp *MLP) Apply(x [][]float64) [][]float64 {
 }
 
 // =============================================================================
-// 3. Transformer Block: объединение самовнимания, остаточных связей и MLP с LayerNorm
+// 3. Transformer Block: объединение компонентов с остаточными связями и нормализацией
 // =============================================================================
 
 type TransformerBlock struct {
@@ -282,14 +287,18 @@ func NewTransformerBlock(embedSize, mlpDim int) *TransformerBlock {
 }
 
 func (tb *TransformerBlock) Apply(x [][]float64) [][]float64 {
+	// Самовнимание.
 	attnOut := tb.Attention.Apply(x)
 	res1 := make([][]float64, len(x))
 	for i := range x {
+		// Остаточная связь и нормализация.
 		res1[i] = tb.AttnNorm.Apply(addVec(x[i], attnOut[i]))
 	}
+	// MLP-блок.
 	mlpOut := tb.MLP.Apply(res1)
 	res2 := make([][]float64, len(res1))
 	for i := range res1 {
+		// Остаточная связь и нормализация.
 		res2[i] = tb.MLPNorm.Apply(addVec(res1[i], mlpOut[i]))
 	}
 	return res2
@@ -301,14 +310,14 @@ func (tb *TransformerBlock) Apply(x [][]float64) [][]float64 {
 
 // TransformerConfig задаёт основные гиперпараметры модели.
 type TransformerConfig struct {
-	VocabSize     int     // Размер словаря (количество уникальных символов)
-	EmbedSize     int     // Размер эмбеддингов (чем больше, тем больше возможностей для представления информации)
-	BlockSize     int     // Максимальная длина входной последовательности (контекст); увеличение улучшает контекст, но требует больше памяти
-	NumHeads      int     // Количество голов внимания (используем 1 для простоты; увеличение может позволить модели учитывать разные аспекты входа)
-	MLPDim        int     // Размер скрытого слоя в MLP (увеличение позволяет модели извлекать более сложные представления, но может привести к переобучению)
-	LearningRate  float64 // Скорость обучения; слишком высокий может вызвать нестабильность, слишком низкий – медленное обучение
-	NumIterations int     // Количество итераций обучения; чем больше, тем лучше модель, но обучение занимает больше времени
-	BatchSize     int     // Размер батча (в данном примере не используется)
+	VocabSize     int     // Количество уникальных символов (размер словаря)
+	EmbedSize     int     // Размер эмбеддингов (чем больше, тем лучше представление, но больше параметров)
+	BlockSize     int     // Максимальная длина входной последовательности (контекст)
+	NumHeads      int     // Количество голов (используем 1 для простоты)
+	MLPDim        int     // Размер скрытого слоя в MLP (увеличение улучшает качество, но требует больше вычислительных ресурсов)
+	LearningRate  float64 // Скорость обучения (слишком высокий – нестабильно, слишком низкий – медленное обучение)
+	NumIterations int     // Количество итераций обучения (чем больше – тем лучше, но дольше)
+	BatchSize     int     // Размер батча (не используется в данном примере)
 }
 
 type TransformerModel struct {
@@ -517,65 +526,117 @@ func loadModel(filename string) (*TransformerModel, error) {
 }
 
 // =============================================================================
-// 10. Обучение модели с чекпоинтами
+// 10. Обучение модели с многопоточностью и сохранением через каналы
 // =============================================================================
 
-// train выполняет обучение модели и сохраняет текущий чекпоинт каждые checkpointInterval итераций.
-// Это позволяет, если обучение прерывается, загрузить последнюю сохранённую модель и продолжить тренировку.
-func train(model *TransformerModel, data []int, char2idx map[rune]int, idx2char map[int]rune) {
-	cfg := model.Cfg
+// Тип задачи для обучения (пустая структура, т.к. задача генерируется внутри воркера).
+type TrainTask struct{}
+
+// trainWorker получает задачи из tasksChan, выполняет forward‑проход и отправляет потерю в resultsChan.
+func trainWorker(model *TransformerModel, data []int, cfg TransformerConfig, resultsChan chan<- float64, tasksChan <-chan TrainTask, stopChan <-chan struct{}) {
 	N := len(data)
-	numIters := cfg.NumIterations
-	checkpointInterval := 1000 // сохраняем модель каждые 1000 итераций (можно изменить, например, на 1 для сохранения после каждой итерации)
-
-	// Выводим основные параметры обучения:
-	fmt.Println("Параметры обучения:")
-	fmt.Printf("  VocabSize: %d (количество уникальных символов)\n", cfg.VocabSize)
-	fmt.Printf("  EmbedSize: %d (размер эмбеддингов; большее значение дает больше возможностей для представления, но замедляет обучение)\n", cfg.EmbedSize)
-	fmt.Printf("  BlockSize: %d (максимальная длина входной последовательности; большее значение улучшает контекст, но требует больше памяти)\n", cfg.BlockSize)
-	fmt.Printf("  MLPDim: %d (размер скрытого слоя MLP; увеличение может улучшить качество, но может привести к переобучению)\n", cfg.MLPDim)
-	fmt.Printf("  LearningRate: %f (скорость обучения; слишком высокий может вызвать нестабильность, слишком низкий – медленное обучение)\n", cfg.LearningRate)
-	fmt.Printf("  NumIterations: %d (количество итераций обучения; чем больше, тем лучше, но обучение занимает больше времени)\n", cfg.NumIterations)
-	fmt.Println("-----------------------------------------------------")
-
-	for iter := 0; iter < numIters; iter++ {
-		start := rand.Intn(N - cfg.BlockSize - 1)
-		inputSeq := data[start : start+cfg.BlockSize]
-		targetSeq := data[start+1 : start+cfg.BlockSize+1]
-
-		logits := model.Forward(inputSeq)
-		totalLoss := 0.0
-		for t := 0; t < len(logits); t++ {
-			totalLoss += crossEntropyLoss(logits[t], targetSeq[t])
+	for {
+		select {
+		case <-stopChan:
+			// Завершаем работу воркера при получении сигнала остановки.
+			return
+		case _, ok := <-tasksChan:
+			if !ok {
+				return
+			}
+			start := rand.Intn(N - cfg.BlockSize - 1)
+			inputSeq := data[start : start+cfg.BlockSize]
+			targetSeq := data[start+1 : start+cfg.BlockSize+1]
+			logits := model.Forward(inputSeq)
+			totalLoss := 0.0
+			for t := 0; t < len(logits); t++ {
+				totalLoss += crossEntropyLoss(logits[t], targetSeq[t])
+			}
+			avgLoss := totalLoss / float64(len(logits))
+			resultsChan <- avgLoss
 		}
-		avgLoss := totalLoss / float64(len(logits))
+	}
+}
+
+// saver — выделенная горутина для сохранения модели, получает сигналы через saveChan.
+func saver(saveChan <-chan struct{}, model *TransformerModel, filename string) {
+	for range saveChan {
+		saveModel(model, filename)
+		fmt.Println("Модель сохранена (чекпоинт).")
+	}
+}
+
+// trainParallel запускает обучение в параллельном режиме, используя все доступные процессоры.
+// Все задачи отправляются через канал, результаты агрегируются, а сохранение модели происходит через выделенную горутину.
+func trainParallel(model *TransformerModel, data []int, char2idx map[rune]int, idx2char map[int]rune) {
+	cfg := model.Cfg
+	numIters := cfg.NumIterations
+	checkpointInterval := 1000 // Сохраняем чекпоинт каждые 1000 итераций
+
+	tasksChan := make(chan TrainTask)
+	resultsChan := make(chan float64)
+	stopChan := make(chan struct{})
+	saveChan := make(chan struct{})
+
+	// Запускаем горутину-сейвер для сохранения модели.
+	go saver(saveChan, model, "model_checkpoint.json")
+
+	// Запускаем пул воркеров (число = runtime.NumCPU())
+	numWorkers := runtime.NumCPU()
+	fmt.Printf("Запущено %d воркеров для обучения.\n", numWorkers)
+	for i := 0; i < numWorkers; i++ {
+		go trainWorker(model, data, cfg, resultsChan, tasksChan, stopChan)
+	}
+
+	// Канал для обработки сигнала завершения (SIGTERM, SIGINT).
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	totalLoss := 0.0
+	iter := 0
+Loop:
+	for iter = 1; iter <= numIters; iter++ {
+		// Перед отправкой задачи проверяем, не поступил ли сигнал завершения.
+		select {
+		case <-sigChan:
+			fmt.Println("Получен сигнал завершения. Сохраняю модель и завершаю обучение.")
+			break Loop
+		default:
+			// Продолжаем
+		}
+
+		tasksChan <- TrainTask{}
+		loss := <-resultsChan
+		totalLoss += loss
 
 		if iter%100 == 0 {
+			avgLoss := totalLoss / 100.0
 			fmt.Printf("Итерация %d, Средняя потеря: %.4f\n", iter, avgLoss)
-			sample := generateText(model, inputSeq[:10], 200, idx2char, 0.8, 5)
+			totalLoss = 0.0
+			// Вывод примера генерации.
+			sample := generateText(model, data[:10], 200, idx2char, 0.8, 5)
 			fmt.Println("Пример сгенерированного текста:")
 			fmt.Println(sample)
 			fmt.Println("--------------------------")
 		}
 
-		// Здесь можно добавить backpropagation и обновление параметров.
-
-		// Сохраняем чекпоинт каждые checkpointInterval итераций.
-		if iter > 0 && iter%checkpointInterval == 0 {
-			saveModel(model, "model_checkpoint.json")
-			fmt.Printf("Чекпоинт сохранен на итерации %d\n", iter)
+		if iter%checkpointInterval == 0 {
+			saveChan <- struct{}{}
 		}
 	}
 
-	// Сохраняем модель в конце обучения.
+	// После завершения цикла (либо по итерациям, либо по сигналу) закрываем каналы.
+	close(tasksChan)
+	close(stopChan)
+	// Сохраняем итоговую модель.
 	saveModel(model, "model.json")
+	fmt.Println("Обучение завершено и модель сохранена в model.json")
 }
 
 // =============================================================================
-// 11. Функция для ответа на вопрос в стиле Шекспира
+// 11. Функция для ответа на вопрос в стиле Шекспира (инференс)
 // =============================================================================
 
-// askQuestion принимает вопрос на английском и генерирует ответ в стиле Шекспира.
 func askQuestion(model *TransformerModel, question string, char2idx map[rune]int, idx2char map[int]rune) string {
 	// Преобразуем вопрос в последовательность токенов.
 	tokens := []int{}
@@ -583,7 +644,7 @@ func askQuestion(model *TransformerModel, question string, char2idx map[rune]int
 		if idx, ok := char2idx[ch]; ok {
 			tokens = append(tokens, idx)
 		} else {
-			tokens = append(tokens, 0) // неизвестный символ -> 0
+			tokens = append(tokens, 0)
 		}
 	}
 	answer := generateText(model, tokens, 200, idx2char, 0.8, 5)
@@ -596,8 +657,9 @@ func askQuestion(model *TransformerModel, question string, char2idx map[rune]int
 
 func main() {
 	rand.Seed(time.Now().UnixNano())
+	// Задействуем все доступные ядра.
+	runtime.GOMAXPROCS(runtime.NumCPU())
 
-	// Флаг для выбора режима: 'train' или 'ask'
 	mode := flag.String("mode", "train", "Режим работы: 'train' для обучения, 'ask' для вопроса")
 	flag.Parse()
 
@@ -609,15 +671,16 @@ func main() {
 	data, char2idx, idx2char := loadDataset(datasetPath)
 	fmt.Printf("Датасет загружен: %d символов, размер словаря: %d\n", len(data), len(char2idx))
 
+	// Основные параметры обучения.
 	cfg := TransformerConfig{
-		VocabSize:     len(char2idx),
-		EmbedSize:     128,
-		BlockSize:     128,
-		NumHeads:      1,
-		MLPDim:        256,
-		LearningRate:  0.0005,
-		NumIterations: 15000,
-		BatchSize:     64,
+		VocabSize:     len(char2idx), // Размер словаря
+		EmbedSize:     128,           // Размер эмбеддингов (больше – лучше представление, но больше параметров)
+		BlockSize:     128,           // Максимальная длина входной последовательности (контекст)
+		NumHeads:      1,             // Количество голов (1 для простоты)
+		MLPDim:        256,           // Размер скрытого слоя в MLP (увеличение улучшает качество, но требует больше ресурсов)
+		LearningRate:  0.0005,        // Скорость обучения (важно подобрать оптимальное значение)
+		NumIterations: 15000,         // Количество итераций обучения (чем больше, тем лучше, но занимает больше времени)
+		BatchSize:     64,            // Размер батча (не используется в данном примере)
 	}
 
 	numBlocks := 6
@@ -629,7 +692,6 @@ func main() {
 		}
 		fmt.Println("Модель загружена!")
 		model = m
-		// Если позиционные эмбеддинги пустые, инициализируем заново.
 		if len(model.Embed.PositionalEmbedding) == 0 {
 			model.Embed.PositionalEmbedding = newRandomMatrix(cfg.BlockSize, cfg.EmbedSize)
 		}
@@ -664,8 +726,7 @@ func main() {
 		fmt.Println(answer)
 	} else {
 		fmt.Println("Начинается обучение модели...")
-		train(model, data, char2idx, idx2char)
-		fmt.Println("Обучение завершено!")
+		trainParallel(model, data, char2idx, idx2char)
 		fmt.Println("Генерация финального текста:")
 		finalText := generateText(model, []int{0}, 200, idx2char, 0.8, 5)
 		fmt.Println(finalText)
