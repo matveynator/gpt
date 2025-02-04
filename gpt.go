@@ -20,6 +20,7 @@ import (
 // 1. Основные матричные операции и функции активации
 // =============================================================================
 
+// dotProduct вычисляет скалярное произведение двух векторов.
 func dotProduct(a, b []float64) float64 {
 	if len(a) != len(b) {
 		log.Fatalf("dotProduct: размеры векторов не совпадают: %d vs %d", len(a), len(b))
@@ -31,6 +32,7 @@ func dotProduct(a, b []float64) float64 {
 	return sum
 }
 
+// matMul выполняет умножение матрицы A (m×n) на матрицу B (n×p) и возвращает матрицу (m×p).
 func matMul(A, B [][]float64) [][]float64 {
 	m := len(A)
 	n := len(A[0])
@@ -49,6 +51,7 @@ func matMul(A, B [][]float64) [][]float64 {
 	return C
 }
 
+// matVecMul умножает матрицу A (m×n) на вектор x (n) и возвращает вектор размера m.
 func matVecMul(A [][]float64, x []float64) []float64 {
 	m := len(A)
 	n := len(A[0])
@@ -66,6 +69,7 @@ func matVecMul(A [][]float64, x []float64) []float64 {
 	return out
 }
 
+// addVec складывает два вектора одинаковой длины.
 func addVec(a, b []float64) []float64 {
 	if len(a) != len(b) {
 		log.Fatalf("addVec: длины векторов не совпадают: %d vs %d", len(a), len(b))
@@ -77,6 +81,7 @@ func addVec(a, b []float64) []float64 {
 	return out
 }
 
+// relu применяет ReLU активацию поэлементно.
 func relu(x []float64) []float64 {
 	out := make([]float64, len(x))
 	for i, v := range x {
@@ -89,6 +94,7 @@ func relu(x []float64) []float64 {
 	return out
 }
 
+// softmax вычисляет softmax для вектора (получаем распределение вероятностей).
 func softmax(x []float64) []float64 {
 	maxVal := x[0]
 	for _, v := range x {
@@ -256,7 +262,7 @@ func (mlp *MLP) Apply(x [][]float64) [][]float64 {
 }
 
 // =============================================================================
-// 3. Transformer Block: объединяет самовнимание, остаточные связи и MLP с LayerNorm
+// 3. Transformer Block: объединение самовнимания, остаточных связей и MLP с LayerNorm
 // =============================================================================
 
 type TransformerBlock struct {
@@ -293,23 +299,24 @@ func (tb *TransformerBlock) Apply(x [][]float64) [][]float64 {
 // 4. Transformer Model: объединение эмбеддингов, блоков и финального слоя
 // =============================================================================
 
+// TransformerConfig задаёт основные гиперпараметры модели.
 type TransformerConfig struct {
-	VocabSize     int     // Размер словаря
-	EmbedSize     int     // Размер эмбеддингов
-	BlockSize     int     // Максимальная длина входной последовательности
-	NumHeads      int     // Количество голов (используем 1 для простоты)
-	MLPDim        int     // Размер скрытого слоя в MLP
-	LearningRate  float64 // Скорость обучения
-	NumIterations int     // Количество итераций обучения
-	BatchSize     int     // Размер батча (не используется)
+	VocabSize     int     // Размер словаря (количество уникальных символов)
+	EmbedSize     int     // Размер эмбеддингов (чем больше, тем больше возможностей для представления информации)
+	BlockSize     int     // Максимальная длина входной последовательности (контекст); увеличение улучшает контекст, но требует больше памяти
+	NumHeads      int     // Количество голов внимания (используем 1 для простоты; увеличение может позволить модели учитывать разные аспекты входа)
+	MLPDim        int     // Размер скрытого слоя в MLP (увеличение позволяет модели извлекать более сложные представления, но может привести к переобучению)
+	LearningRate  float64 // Скорость обучения; слишком высокий может вызвать нестабильность, слишком низкий – медленное обучение
+	NumIterations int     // Количество итераций обучения; чем больше, тем лучше модель, но обучение занимает больше времени
+	BatchSize     int     // Размер батча (в данном примере не используется)
 }
 
 type TransformerModel struct {
 	Cfg         TransformerConfig   `json:"cfg"`
 	Embed       *Embedding          `json:"embed"`
 	Blocks      []*TransformerBlock `json:"blocks"`
-	FinalLinear [][]float64         `json:"finalLinear"` // VocabSize x EmbedSize
-	FinalBias   []float64           `json:"finalBias"`   // VocabSize
+	FinalLinear [][]float64         `json:"finalLinear"` // Проекция: VocabSize x EmbedSize
+	FinalBias   []float64           `json:"finalBias"`   // Смещения: VocabSize
 }
 
 func NewTransformerModel(cfg TransformerConfig, numBlocks int) *TransformerModel {
@@ -510,16 +517,26 @@ func loadModel(filename string) (*TransformerModel, error) {
 }
 
 // =============================================================================
-// 10. Обучение модели (Skeleton)
+// 10. Обучение модели с чекпоинтами
 // =============================================================================
 
-// Здесь реализован skeleton обучения (forward‑проход и вычисление потерь).
-// Обратное распространение не реализовано полностью.
-// Кроме того, модель сохраняется периодически (каждые 1000 итераций).
+// train выполняет обучение модели и сохраняет текущий чекпоинт каждые checkpointInterval итераций.
+// Это позволяет, если обучение прерывается, загрузить последнюю сохранённую модель и продолжить тренировку.
 func train(model *TransformerModel, data []int, char2idx map[rune]int, idx2char map[int]rune) {
 	cfg := model.Cfg
 	N := len(data)
 	numIters := cfg.NumIterations
+	checkpointInterval := 1000 // сохраняем модель каждые 1000 итераций (можно изменить, например, на 1 для сохранения после каждой итерации)
+
+	// Выводим основные параметры обучения:
+	fmt.Println("Параметры обучения:")
+	fmt.Printf("  VocabSize: %d (количество уникальных символов)\n", cfg.VocabSize)
+	fmt.Printf("  EmbedSize: %d (размер эмбеддингов; большее значение дает больше возможностей для представления, но замедляет обучение)\n", cfg.EmbedSize)
+	fmt.Printf("  BlockSize: %d (максимальная длина входной последовательности; большее значение улучшает контекст, но требует больше памяти)\n", cfg.BlockSize)
+	fmt.Printf("  MLPDim: %d (размер скрытого слоя MLP; увеличение может улучшить качество, но может привести к переобучению)\n", cfg.MLPDim)
+	fmt.Printf("  LearningRate: %f (скорость обучения; слишком высокий может вызвать нестабильность, слишком низкий – медленное обучение)\n", cfg.LearningRate)
+	fmt.Printf("  NumIterations: %d (количество итераций обучения; чем больше, тем лучше, но обучение занимает больше времени)\n", cfg.NumIterations)
+	fmt.Println("-----------------------------------------------------")
 
 	for iter := 0; iter < numIters; iter++ {
 		start := rand.Intn(N - cfg.BlockSize - 1)
@@ -543,33 +560,32 @@ func train(model *TransformerModel, data []int, char2idx map[rune]int, idx2char 
 
 		// Здесь можно добавить backpropagation и обновление параметров.
 
-		// Сохраняем модель каждые 1000 итераций.
-		if iter > 0 && iter%1000 == 0 {
-			saveModel(model, "model.json")
-			fmt.Printf("Модель сохранена на итерации %d\n", iter)
+		// Сохраняем чекпоинт каждые checkpointInterval итераций.
+		if iter > 0 && iter%checkpointInterval == 0 {
+			saveModel(model, "model_checkpoint.json")
+			fmt.Printf("Чекпоинт сохранен на итерации %d\n", iter)
 		}
 	}
 
+	// Сохраняем модель в конце обучения.
 	saveModel(model, "model.json")
 }
 
 // =============================================================================
-// 11. Функция для ответа на вопрос (инференс)
+// 11. Функция для ответа на вопрос в стиле Шекспира
 // =============================================================================
 
-// askQuestion принимает вопрос на английском, преобразует его в токены и генерирует ответ в стиле Шекспира.
+// askQuestion принимает вопрос на английском и генерирует ответ в стиле Шекспира.
 func askQuestion(model *TransformerModel, question string, char2idx map[rune]int, idx2char map[int]rune) string {
 	// Преобразуем вопрос в последовательность токенов.
-	// Для каждого символа в вопросе, если его нет в словаре, используем индекс 0.
 	tokens := []int{}
 	for _, ch := range question {
 		if idx, ok := char2idx[ch]; ok {
 			tokens = append(tokens, idx)
 		} else {
-			tokens = append(tokens, 0)
+			tokens = append(tokens, 0) // неизвестный символ -> 0
 		}
 	}
-	// Генерируем ответ с помощью модели.
 	answer := generateText(model, tokens, 200, idx2char, 0.8, 5)
 	return answer
 }
@@ -581,8 +597,8 @@ func askQuestion(model *TransformerModel, question string, char2idx map[rune]int
 func main() {
 	rand.Seed(time.Now().UnixNano())
 
-	// Флаг для режима вопрос-ответ.
-	mode := flag.String("mode", "train", "Режим: 'train' для обучения, 'ask' для вопроса")
+	// Флаг для выбора режима: 'train' или 'ask'
+	mode := flag.String("mode", "train", "Режим работы: 'train' для обучения, 'ask' для вопроса")
 	flag.Parse()
 
 	datasetPath := "tinyshakespeare.txt"
@@ -607,7 +623,6 @@ func main() {
 	numBlocks := 6
 	var model *TransformerModel
 	if *mode == "ask" {
-		// Если режим "ask", пытаемся загрузить модель.
 		m, err := loadModel("model.json")
 		if err != nil {
 			log.Fatalf("Модель не найдена! Сначала обучите модель (mode=train)")
@@ -620,7 +635,6 @@ func main() {
 		}
 		model.Cfg = cfg
 	} else {
-		// Режим обучения.
 		if _, err := os.Stat("model.json"); err != nil {
 			fmt.Println("Сохранённая модель не найдена, создаём новую модель...")
 			model = NewTransformerModel(cfg, numBlocks)
@@ -641,7 +655,6 @@ func main() {
 	}
 
 	if *mode == "ask" {
-		// Режим вопрос-ответ.
 		reader := bufio.NewReader(os.Stdin)
 		fmt.Println("Введите ваш вопрос на английском:")
 		question, _ := reader.ReadString('\n')
@@ -650,7 +663,6 @@ func main() {
 		fmt.Println("Ответ в стиле Шекспира:")
 		fmt.Println(answer)
 	} else {
-		// Режим обучения.
 		fmt.Println("Начинается обучение модели...")
 		train(model, data, char2idx, idx2char)
 		fmt.Println("Обучение завершено!")
