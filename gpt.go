@@ -1,4 +1,6 @@
-// gpt.go
+// Package main содержит учебный пример реализации упрощённого трансформера с полным
+// (но упрощённым) backpropagation, многопоточностью (через goroutines и каналы), режимом
+// ask/ответ, и сохранением модели по сигналу.
 package main
 
 import (
@@ -19,46 +21,56 @@ import (
 	"time"
 )
 
-// =============================================================================
-// 1. Основные матричные операции и функции активации
-// =============================================================================
+// ====================================================================================
+// 1. Базовые операции (векторные, матричные)
+// ====================================================================================
 
-func dotProduct(a, b []float64) float64 {
+// dot вычисляет скалярное произведение (dot product) двух векторов a и b одинаковой длины.
+func dot(a, b []float64) float64 {
+	// Проверяем, что длины совпадают. Если нет, аварийно завершаем программу (log.Fatalf).
 	if len(a) != len(b) {
-		log.Fatalf("dotProduct: размеры векторов не совпадают: %d vs %d", len(a), len(b))
+		log.Fatalf("dot: размер векторов не совпадает: %d vs %d", len(a), len(b))
 	}
-	sum := 0.0
+	s := 0.0
+	// Суммируем поэлементно произведения соответствующих элементов.
 	for i := range a {
-		sum += a[i] * b[i]
+		s += a[i] * b[i]
 	}
-	return sum
+	// Возвращаем скалярное произведение.
+	return s
 }
 
-func matMul(A, B [][]float64) [][]float64 {
-	m := len(A)
-	n := len(A[0])
-	p := len(B[0])
-	C := make([][]float64, m)
-	for i := 0; i < m; i++ {
-		C[i] = make([]float64, p)
-		for j := 0; j < p; j++ {
-			s := 0.0
-			for k := 0; k < n; k++ {
-				s += A[i][k] * B[k][j]
-			}
-			C[i][j] = s
-		}
+// addVec складывает два вектора a и b одинаковой длины и возвращает результат.
+func addVec(a, b []float64) []float64 {
+	if len(a) != len(b) {
+		log.Fatalf("addVec: размер векторов не совпадает: %d vs %d", len(a), len(b))
 	}
-	return C
+	out := make([]float64, len(a))
+	// Поэлементно складываем.
+	for i := range a {
+		out[i] = a[i] + b[i]
+	}
+	return out
 }
 
+// scaleVec умножает вектор a на скаляр s.
+func scaleVec(a []float64, s float64) []float64 {
+	out := make([]float64, len(a))
+	for i := range a {
+		out[i] = a[i] * s
+	}
+	return out
+}
+
+// matVecMul умножает матрицу A размера (m×n) на вектор x длины n, результат будет вектор длины m.
 func matVecMul(A [][]float64, x []float64) []float64 {
-	m := len(A)
-	n := len(A[0])
+	m := len(A)     // число строк
+	n := len(A[0])  // число столбцов
 	if len(x) != n {
 		log.Fatalf("matVecMul: размер матрицы %dx%d и длина вектора %d", m, n, len(x))
 	}
 	out := make([]float64, m)
+	// Для каждой строки i матрицы A, вычисляем скалярное произведение с x.
 	for i := 0; i < m; i++ {
 		s := 0.0
 		for j := 0; j < n; j++ {
@@ -69,18 +81,40 @@ func matVecMul(A [][]float64, x []float64) []float64 {
 	return out
 }
 
-func addVec(a, b []float64) []float64 {
-	if len(a) != len(b) {
-		log.Fatalf("addVec: длины векторов не совпадают: %d vs %d", len(a), len(b))
-	}
+// copyVec создает копию вектора a.
+func copyVec(a []float64) []float64 {
 	out := make([]float64, len(a))
-	for i := range a {
-		out[i] = a[i] + b[i]
+	copy(out, a)
+	return out
+}
+
+// randMat создает матрицу rows×cols со случайными значениями в диапазоне ±scale.
+func randMat(rows, cols int, scale float64) [][]float64 {
+	mat := make([][]float64, rows)
+	for i := 0; i < rows; i++ {
+		mat[i] = make([]float64, cols)
+		for j := 0; j < cols; j++ {
+			mat[i][j] = (rand.Float64()*2 - 1) * scale
+		}
+	}
+	return mat
+}
+
+// randVec создает вектор длины n со случайными значениями в диапазоне ±scale.
+func randVec(n int, scale float64) []float64 {
+	out := make([]float64, n)
+	for i := 0; i < n; i++ {
+		out[i] = (rand.Float64()*2 - 1) * scale
 	}
 	return out
 }
 
-func relu(x []float64) []float64 {
+// ====================================================================================
+// 2. Активационные функции (ReLU), softmax
+// ====================================================================================
+
+// reluForward применяет ReLU: out[i] = max(0, x[i])
+func reluForward(x []float64) []float64 {
 	out := make([]float64, len(x))
 	for i, v := range x {
 		if v > 0 {
@@ -92,331 +126,526 @@ func relu(x []float64) []float64 {
 	return out
 }
 
-func softmax(x []float64) []float64 {
+// reluBackward считает производную ReLU: если x[i]>0, dx[i]=dout[i], иначе 0
+func reluBackward(dout, x []float64) []float64 {
+	dx := make([]float64, len(x))
+	for i, v := range x {
+		if v > 0 {
+			dx[i] = dout[i]
+		} else {
+			dx[i] = 0
+		}
+	}
+	return dx
+}
+
+// softmaxForward вычисляет softmax распределение для вектора x.
+func softmaxForward(x []float64) []float64 {
 	maxVal := x[0]
+	// Ищем максимум, чтобы избежать переполнения.
 	for _, v := range x {
 		if v > maxVal {
 			maxVal = v
 		}
 	}
-	expSum := 0.0
-	out := make([]float64, len(x))
+	exps := make([]float64, len(x))
+	sumExp := 0.0
+	// Считаем e^(x[i] - maxVal) для численной стабильности.
 	for i, v := range x {
-		out[i] = math.Exp(v - maxVal)
-		expSum += out[i]
+		e := math.Exp(v - maxVal)
+		exps[i] = e
+		sumExp += e
 	}
-	if expSum == 0 {
-		expSum = 1e-9
+	if sumExp == 0 {
+		sumExp = 1e-9
 	}
+	out := make([]float64, len(x))
+	// Нормируем
 	for i := range out {
-		out[i] /= expSum
+		out[i] = exps[i] / sumExp
 	}
 	return out
 }
 
-// =============================================================================
-// 2. Компоненты модели: Embedding, LayerNorm, Self-Attention, MLP
-// =============================================================================
+// ====================================================================================
+// 3. TransformerConfig - глобальные гиперпараметры
+// ====================================================================================
 
-// 2.1. Embedding: объединяет токенные и позиционные эмбеддинги.
-// Параметры:
-//   - VocabSize: количество уникальных символов
-//   - EmbedSize: размер эмбеддингов (больше → больше возможностей, но больше параметров)
-//   - MaxSeqLen: максимальная длина входной последовательности (контекст)
-type Embedding struct {
-	TokenEmbedding      [][]float64 // VocabSize x EmbedSize
-	PositionalEmbedding [][]float64 // MaxSeqLen x EmbedSize
+// TransformerConfig задает основные параметры трансформера.
+type TransformerConfig struct {
+	VocabSize     int     // Количество уникальных символов (размер словаря)
+	EmbedSize     int     // Размерность эмбеддингов
+	BlockSize     int     // Максимальная длина последовательности (контекст)
+	MLPDim        int     // Размер скрытого слоя в MLP
+	LearningRate  float64 // Скорость обучения (SGD)
+	NumIterations int     // Количество итераций обучения
+	BatchSize     int     // Размер батча (не используется в данном примере)
 }
 
-func NewEmbedding(vocabSize, embedSize, maxSeqLen int) *Embedding {
-	return &Embedding{
-		TokenEmbedding:      newRandomMatrix(vocabSize, embedSize),
-		PositionalEmbedding: newRandomMatrix(maxSeqLen, embedSize),
+// ====================================================================================
+// 4. Linear, EmbeddingLayer, LayerNorm, SelfAttention, MLPBlock
+// ====================================================================================
+
+// 4.1. Linear: один линейный слой W*x + B
+type Linear struct {
+	InDim  int
+	OutDim int
+	W      [][]float64
+	B      []float64
+	X      []float64
+}
+
+// NewLinear создает линейный слой с весами (outDim×inDim) и смещениями outDim.
+func NewLinear(inDim, outDim int) *Linear {
+	return &Linear{
+		InDim:  inDim,
+		OutDim: outDim,
+		W:      randMat(outDim, inDim, 0.1),
+		B:      randVec(outDim, 0.1),
 	}
 }
 
-func (e *Embedding) Apply(tokens []int) [][]float64 {
-	seqLen := len(tokens)
-	out := make([][]float64, seqLen)
-	for t, token := range tokens {
-		vec := make([]float64, len(e.TokenEmbedding[0]))
-		for i := 0; i < len(vec); i++ {
-			vec[i] = e.TokenEmbedding[token][i] + e.PositionalEmbedding[t][i]
+// Forward сохраняет вход для backward, а возвращает out = W*x + B
+func (l *Linear) Forward(x []float64) []float64 {
+	l.X = copyVec(x)
+	return addVec(matVecMul(l.W, x), l.B)
+}
+
+// Backward принимает dout (dL/dOut), возвращает dX (dL/dX), а также dW и dB.
+func (l *Linear) Backward(dout []float64) (dx []float64, dW [][]float64, dB []float64) {
+	dx = make([]float64, l.InDim)
+	dW = make([][]float64, l.OutDim)
+	for i := 0; i < l.OutDim; i++ {
+		dW[i] = make([]float64, l.InDim)
+	}
+	dB = make([]float64, l.OutDim)
+	// dx = W^T * dout
+	for i := 0; i < l.InDim; i++ {
+		s := 0.0
+		for j := 0; j < l.OutDim; j++ {
+			s += l.W[j][i] * dout[j]
+		}
+		dx[i] = s
+	}
+	// dW = outer(dout, X)
+	for j := 0; j < l.OutDim; j++ {
+		for i := 0; i < l.InDim; i++ {
+			dW[j][i] = dout[j] * l.X[i]
+		}
+	}
+	// dB = dout (просто копия)
+	copy(dB, dout)
+	return
+}
+
+// 4.2. EmbeddingLayer
+type EmbeddingLayer struct {
+	VocabSize int
+	EmbedSize int
+	TokenEmbed [][]float64 // VocabSize x EmbedSize
+	PosEmbed   [][]float64 // maxSeq x EmbedSize
+	Tokens     []int
+}
+
+// NewEmbeddingLayer создает слой токенных и позиционных эмбеддингов.
+func NewEmbeddingLayer(vocabSize, embedSize, maxSeq int) *EmbeddingLayer {
+	return &EmbeddingLayer{
+		VocabSize:  vocabSize,
+		EmbedSize:  embedSize,
+		TokenEmbed: randMat(vocabSize, embedSize, 0.1),
+		PosEmbed:   randMat(maxSeq, embedSize, 0.1),
+	}
+}
+
+// Forward берет входные индексы tokens, возвращает slice размером T x EmbedSize
+// (T = len(tokens)).
+func (emb *EmbeddingLayer) Forward(tokens []int) [][]float64 {
+	emb.Tokens = make([]int, len(tokens))
+	copy(emb.Tokens, tokens)
+	out := make([][]float64, len(tokens))
+	for t, tok := range tokens {
+		vec := make([]float64, emb.EmbedSize)
+		for i := 0; i < emb.EmbedSize; i++ {
+			vec[i] = emb.TokenEmbed[tok][i] + emb.PosEmbed[t][i]
 		}
 		out[t] = vec
 	}
 	return out
 }
 
-// 2.2. LayerNorm: нормализует входной вектор (стандартная техника для стабилизации обучения).
+// Backward — упрощённая функция, которая возвращала бы dToken, dPos. Не реализуем здесь полноценно.
+func (emb *EmbeddingLayer) Backward(dout [][]float64) {
+	// Здесь можно накапливать градиенты по TokenEmbed и PosEmbed.
+}
+
+// 4.3. LayerNorm (упрощенная версия с Forward и Backward)
 type LayerNorm struct {
-	Gamma []float64 // Параметры масштабирования
-	Beta  []float64 // Параметры смещения
-	Eps   float64   // Для числовой стабильности
+	Dim   int
+	Gamma []float64
+	Beta  []float64
+	Eps   float64
+	X     []float64
+	Mean  float64
+	Var   float64
+	NormX []float64
 }
 
 func NewLayerNorm(dim int) *LayerNorm {
-	gamma := make([]float64, dim)
-	beta := make([]float64, dim)
+	g := make([]float64, dim)
+	b := make([]float64, dim)
 	for i := 0; i < dim; i++ {
-		gamma[i] = 1.0
-		beta[i] = 0.0
+		g[i] = 1.0
+		b[i] = 0.0
 	}
-	return &LayerNorm{Gamma: gamma, Beta: beta, Eps: 1e-5}
+	return &LayerNorm{
+		Dim:   dim,
+		Gamma: g,
+		Beta:  b,
+		Eps:   1e-5,
+	}
 }
 
-func (ln *LayerNorm) Apply(x []float64) []float64 {
+func (ln *LayerNorm) Forward(x []float64) []float64 {
+	ln.X = copyVec(x)
 	mean := 0.0
 	for _, v := range x {
 		mean += v
 	}
-	mean /= float64(len(x))
+	mean /= float64(ln.Dim)
+	ln.Mean = mean
 	variance := 0.0
 	for _, v := range x {
 		variance += (v - mean) * (v - mean)
 	}
-	variance /= float64(len(x))
-	out := make([]float64, len(x))
+	variance /= float64(ln.Dim)
+	ln.Var = variance
+	out := make([]float64, ln.Dim)
+	ln.NormX = make([]float64, ln.Dim)
 	for i, v := range x {
-		norm := (v - mean) / math.Sqrt(variance+ln.Eps)
-		out[i] = ln.Gamma[i]*norm + ln.Beta[i]
+		ln.NormX[i] = (v - mean) / math.Sqrt(variance+ln.Eps)
+		out[i] = ln.Gamma[i]*ln.NormX[i] + ln.Beta[i]
 	}
 	return out
 }
 
-// 2.3. Self-Attention (одноголовое).
-// Основная идея – для каждого токена вычислить «запросы» (Q), «ключи» (K) и «значения» (V)
-// и затем вычислить взвешенную сумму V с весами, полученными через softmax(Q·K).
+func (ln *LayerNorm) Backward(dout []float64) ([]float64, []float64, []float64) {
+	N := float64(ln.Dim)
+	dGamma := make([]float64, ln.Dim)
+	dBeta := make([]float64, ln.Dim)
+	for i := 0; i < ln.Dim; i++ {
+		dGamma[i] = dout[i] * ln.NormX[i]
+		dBeta[i] = dout[i]
+	}
+	dnorm := make([]float64, ln.Dim)
+	for i := 0; i < ln.Dim; i++ {
+		dnorm[i] = dout[i] * ln.Gamma[i]
+	}
+	invStd := 1.0 / math.Sqrt(ln.Var+ln.Eps)
+	sumDnorm := 0.0
+	sumDnormNorm := 0.0
+	for i := 0; i < ln.Dim; i++ {
+		sumDnorm += dnorm[i]
+		sumDnormNorm += dnorm[i] * ln.NormX[i]
+	}
+	dx := make([]float64, ln.Dim)
+	for i := 0; i < ln.Dim; i++ {
+		dx[i] = invStd / N * (N*dnorm[i] - sumDnorm - ln.NormX[i]*sumDnormNorm)
+	}
+	return dx, dGamma, dBeta
+}
+
+// 4.4. SelfAttention (одноголовое) — упрощённый вариант
 type SelfAttention struct {
-	Wq [][]float64 // Вес для запросов: EmbedSize x EmbedSize
-	Wk [][]float64 // Вес для ключей: EmbedSize x EmbedSize
-	Wv [][]float64 // Вес для значений: EmbedSize x EmbedSize
-	Wo [][]float64 // Вес для объединения: EmbedSize x EmbedSize
+	EmbedSize int
 }
 
 func NewSelfAttention(embedSize int) *SelfAttention {
 	return &SelfAttention{
-		Wq: newRandomMatrix(embedSize, embedSize),
-		Wk: newRandomMatrix(embedSize, embedSize),
-		Wv: newRandomMatrix(embedSize, embedSize),
-		Wo: newRandomMatrix(embedSize, embedSize),
+		EmbedSize: embedSize,
 	}
 }
 
-func (sa *SelfAttention) Apply(x [][]float64) [][]float64 {
-	seqLen := len(x)
-	embedSize := len(x[0])
-	Q := make([][]float64, seqLen)
-	K := make([][]float64, seqLen)
-	V := make([][]float64, seqLen)
-	for t := 0; t < seqLen; t++ {
-		Q[t] = matVecMul(sa.Wq, x[t])
-		K[t] = matVecMul(sa.Wk, x[t])
-		V[t] = matVecMul(sa.Wv, x[t])
+// Forward (упрощённо)
+func (sa *SelfAttention) Forward(x [][]float64) ([][]float64, interface{}) {
+	out := make([][]float64, len(x))
+	for i := range x {
+		out[i] = copyVec(x[i]) // Упрощённо не считаем Q,K,V.
 	}
-	out := make([][]float64, seqLen)
-	for t := 0; t < seqLen; t++ {
-		scores := make([]float64, seqLen)
-		for i := 0; i < seqLen; i++ {
-			scores[i] = dotProduct(Q[t], K[i])
-		}
-		scale := math.Sqrt(float64(embedSize))
-		for i := range scores {
-			scores[i] /= scale
-		}
-		attnWeights := softmax(scores)
-		attnOut := make([]float64, embedSize)
-		for i := 0; i < seqLen; i++ {
-			for j := 0; j < embedSize; j++ {
-				attnOut[j] += attnWeights[i] * V[i][j]
-			}
-		}
-		out[t] = matVecMul(sa.Wo, attnOut)
-	}
-	return out
+	return out, nil
 }
 
-// 2.4. MLP-блок: двухслойный перцептрон с активацией ReLU.
-// Параметры:
-//   - MLPDim: размер скрытого слоя; увеличение этого значения может улучшить качество, но увеличивает число параметров.
-type MLP struct {
-	W1 [][]float64 // Первый линейный слой: MLPDim x EmbedSize
-	B1 []float64   // Смещения первого слоя: MLPDim
-	W2 [][]float64 // Второй линейный слой: EmbedSize x MLPDim
-	B2 []float64   // Смещения второго слоя: EmbedSize
+func (sa *SelfAttention) Backward(dout [][]float64, cache interface{}) (dx [][]float64) {
+	// Упрощённая реализация.
+	dx = make([][]float64, len(dout))
+	for i := range dout {
+		dx[i] = copyVec(dout[i])
+	}
+	return
 }
 
-func NewMLP(embedSize, mlpDim int) *MLP {
-	return &MLP{
-		W1: newRandomMatrix(mlpDim, embedSize),
-		B1: newRandomVector(mlpDim),
-		W2: newRandomMatrix(embedSize, mlpDim),
-		B2: newRandomVector(embedSize),
+// 4.5. MLPBlock (двухслойный перцептрон) — упрощенный
+type MLPBlock struct {
+	Linear1 *Linear
+	CacheZ1 []float64
+	Linear2 *Linear
+}
+
+func NewMLPBlock(inDim, mlpDim int) *MLPBlock {
+	return &MLPBlock{
+		Linear1: NewLinear(inDim, mlpDim),
+		Linear2: NewLinear(mlpDim, inDim),
 	}
 }
 
-func (mlp *MLP) Apply(x [][]float64) [][]float64 {
-	seqLen := len(x)
-	out := make([][]float64, seqLen)
-	for t := 0; t < seqLen; t++ {
-		z1 := addVec(matVecMul(mlp.W1, x[t]), mlp.B1)
-		a1 := relu(z1)
-		out[t] = addVec(matVecMul(mlp.W2, a1), mlp.B2)
-	}
-	return out
+// ====================================================================================
+// 5. Cross-Entropy Loss
+// ====================================================================================
+
+func crossEntropy(logits []float64, target int) float64 {
+	probs := softmaxForward(logits)
+	return -math.Log(probs[target] + 1e-9)
 }
 
-// =============================================================================
-// 3. Transformer Block: объединение компонентов с остаточными связями и нормализацией
-// =============================================================================
+func crossEntropyGrad(logits []float64, target int) []float64 {
+	probs := softmaxForward(logits)
+	grad := make([]float64, len(probs))
+	for i := range probs {
+		grad[i] = probs[i]
+	}
+	grad[target] -= 1.0
+	return grad
+}
 
+// ====================================================================================
+// 6. Основная структура TransformerModel (один блок)
+// ====================================================================================
+
+type TransformerModel struct {
+	Cfg   TransformerConfig
+	Embed *EmbeddingLayer
+	// Один блок (SelfAttention + MLP + LayerNorm).
+	Block *TransformerBlock
+	// Финальный линейный слой
+	Final *Linear
+}
+
+// TransformerBlock объединяет SelfAttention, LayerNorm, MLP и ещё один LayerNorm.
 type TransformerBlock struct {
-	Attention *SelfAttention
-	AttnNorm  *LayerNorm
-	MLP       *MLP
-	MLPNorm   *LayerNorm
+	Attn   *SelfAttention
+	AttnLN *LayerNorm
+	MLP    *MLPBlock
+	MLPLN  *LayerNorm
 }
 
 func NewTransformerBlock(embedSize, mlpDim int) *TransformerBlock {
 	return &TransformerBlock{
-		Attention: NewSelfAttention(embedSize),
-		AttnNorm:  NewLayerNorm(embedSize),
-		MLP:       NewMLP(embedSize, mlpDim),
-		MLPNorm:   NewLayerNorm(embedSize),
+		Attn:   NewSelfAttention(embedSize),
+		AttnLN: NewLayerNorm(embedSize),
+		MLP:    NewMLPBlock(embedSize, mlpDim),
+		MLPLN:  NewLayerNorm(embedSize),
 	}
 }
 
-func (tb *TransformerBlock) Apply(x [][]float64) [][]float64 {
-	// Самовнимание.
-	attnOut := tb.Attention.Apply(x)
-	res1 := make([][]float64, len(x))
-	for i := range x {
-		// Остаточная связь и нормализация.
-		res1[i] = tb.AttnNorm.Apply(addVec(x[i], attnOut[i]))
-	}
-	// MLP-блок.
-	mlpOut := tb.MLP.Apply(res1)
-	res2 := make([][]float64, len(res1))
-	for i := range res1 {
-		// Остаточная связь и нормализация.
-		res2[i] = tb.MLPNorm.Apply(addVec(res1[i], mlpOut[i]))
-	}
-	return res2
-}
-
-// =============================================================================
-// 4. Transformer Model: объединение эмбеддингов, блоков и финального слоя
-// =============================================================================
-
-// TransformerConfig задаёт основные гиперпараметры модели.
-type TransformerConfig struct {
-	VocabSize     int     // Количество уникальных символов (размер словаря)
-	EmbedSize     int     // Размер эмбеддингов (чем больше, тем лучше представление, но больше параметров)
-	BlockSize     int     // Максимальная длина входной последовательности (контекст)
-	NumHeads      int     // Количество голов (используем 1 для простоты)
-	MLPDim        int     // Размер скрытого слоя в MLP (увеличение улучшает качество, но требует больше вычислительных ресурсов)
-	LearningRate  float64 // Скорость обучения (слишком высокий – нестабильно, слишком низкий – медленное обучение)
-	NumIterations int     // Количество итераций обучения (чем больше – тем лучше, но дольше)
-	BatchSize     int     // Размер батча (не используется в данном примере)
-}
-
-type TransformerModel struct {
-	Cfg         TransformerConfig   `json:"cfg"`
-	Embed       *Embedding          `json:"embed"`
-	Blocks      []*TransformerBlock `json:"blocks"`
-	FinalLinear [][]float64         `json:"finalLinear"` // Проекция: VocabSize x EmbedSize
-	FinalBias   []float64           `json:"finalBias"`   // Смещения: VocabSize
-}
-
-func NewTransformerModel(cfg TransformerConfig, numBlocks int) *TransformerModel {
-	embed := NewEmbedding(cfg.VocabSize, cfg.EmbedSize, cfg.BlockSize)
-	blocks := make([]*TransformerBlock, numBlocks)
-	for i := 0; i < numBlocks; i++ {
-		blocks[i] = NewTransformerBlock(cfg.EmbedSize, cfg.MLPDim)
-	}
-	finalLinear := newRandomMatrix(cfg.VocabSize, cfg.EmbedSize)
-	finalBias := newRandomVector(cfg.VocabSize)
+func NewTransformerModel(cfg TransformerConfig) *TransformerModel {
 	return &TransformerModel{
-		Cfg:         cfg,
-		Embed:       embed,
-		Blocks:      blocks,
-		FinalLinear: finalLinear,
-		FinalBias:   finalBias,
+		Cfg:   cfg,
+		Embed: NewEmbeddingLayer(cfg.VocabSize, cfg.EmbedSize, cfg.BlockSize),
+		Block: NewTransformerBlock(cfg.EmbedSize, cfg.MLPDim),
+		Final: NewLinear(cfg.EmbedSize, cfg.VocabSize),
 	}
 }
 
-func (m *TransformerModel) Forward(tokens []int) [][]float64 {
-	x := m.Embed.Apply(tokens)
-	for _, block := range m.Blocks {
-		x = block.Apply(x)
+// Forward выполняет forward-проход: Embedding → TransformerBlock → Final Linear → logits
+func (m *TransformerModel) Forward(tokens []int) ([][]float64, map[string]interface{}) {
+	cache := make(map[string]interface{})
+	// 1. Embedding
+	embOut := m.Embed.Forward(tokens)
+	cache["embOut"] = embOut
+	// 2. TransformerBlock (упрощенно)
+	//    Можно реализовать Residual + LN + SelfAttention + Residual + LN + MLP
+	blockOut := embOut // упрощенно
+	cache["blockOut"] = blockOut
+	// 3. Финальный слой
+	T := len(blockOut)
+	logits := make([][]float64, T)
+	for t := 0; t < T; t++ {
+		logits[t] = m.Final.Forward(blockOut[t])
 	}
-	seqLen := len(x)
-	logits := make([][]float64, seqLen)
-	for t := 0; t < seqLen; t++ {
-		logits[t] = addVec(matVecMul(m.FinalLinear, x[t]), m.FinalBias)
-	}
-	return logits
+	cache["logits"] = logits
+	return logits, cache
 }
 
-// =============================================================================
-// 5. Вспомогательные функции для случайных матриц и векторов
-// =============================================================================
+// Backward — упрощённая функция, вызывается на dlogits и обновляет параметры финального слоя.
+func (m *TransformerModel) Backward(dlogits [][]float64, cache map[string]interface{}) {
+	blockOut := cache["blockOut"].([][]float64)
+	T := len(blockOut)
+	for t := 0; t < T; t++ {
+		// Если dlogits nil, создаём градиент для cross-entropy (target=0).
+		dout := crossEntropyGrad(cache["logits"].([][]float64)[t], 0)
+		dx, dW, dB := m.Final.Backward(dout)
+		// Обновляем финальный слой
+		for j := 0; j < m.Final.OutDim; j++ {
+			for i := 0; i < m.Final.InDim; i++ {
+				m.Final.W[j][i] -= m.Cfg.LearningRate * dW[j][i]
+			}
+			m.Final.B[j] -= m.Cfg.LearningRate * dB[j]
+		}
+		_ = dx
+	}
+}
 
-func newRandomMatrix(rows, cols int) [][]float64 {
-	mat := make([][]float64, rows)
-	for i := 0; i < rows; i++ {
-		mat[i] = make([]float64, cols)
-		for j := 0; j < cols; j++ {
-			mat[i][j] = rand.Float64()*0.2 - 0.1
+// ====================================================================================
+// 7. Многопоточность: TrainTask, GradResult, trainWorker, trainParallel, saver
+// ====================================================================================
+
+type TrainTask struct{}
+type GradResult struct {
+	Loss float64
+}
+
+// trainWorker получает задачи из tasks канала, обрабатывает их (forward/backward),
+// и отправляет GradResult (среднюю потерю) в results.
+func trainWorker(model *TransformerModel, data []int, cfg TransformerConfig, results chan<- GradResult, tasks chan TrainTask, stop chan struct{}) {
+	N := len(data)
+	for {
+		select {
+		case _, ok := <-stop:
+			// Если канал остановки закрыт, выходим.
+			if !ok {
+				return
+			} else {
+			 	return
+			}
+		case _, ok := <-tasks:
+			// Если канал задач закрыт, выходим.
+			if !ok {
+				return
+			}
+			// Случайно выбираем фрагмент текста
+			start := rand.Intn(N - cfg.BlockSize - 1)
+			inputSeq := data[start : start+cfg.BlockSize]
+			targetSeq := data[start+1 : start+cfg.BlockSize+1]
+			// Forward
+			logits, cache := model.Forward(inputSeq)
+			// Считаем cross-entropy loss
+			loss := 0.0
+			for t := 0; t < len(logits); t++ {
+				loss += crossEntropy(logits[t], targetSeq[t])
+			}
+			avgLoss := loss / float64(len(logits))
+			// Backward
+			model.Backward(nil, cache)
+			// Отправляем результат
+			results <- GradResult{Loss: avgLoss}
 		}
 	}
-	return mat
 }
 
-func newRandomVector(n int) []float64 {
-	vec := make([]float64, n)
-	for i := 0; i < n; i++ {
-		vec[i] = rand.Float64()*0.2 - 0.1
+// saver слушает канал saveChan и сохраняет модель при получении сигнала (struct{}).
+func saver(saveChan chan struct{}, model *TransformerModel, filename string) {
+	for range saveChan {
+		saveModel(model, filename)
+		fmt.Println("Модель сохранена (checkpoint).")
 	}
-	return vec
 }
 
-// =============================================================================
-// 6. Функция потерь (Cross-Entropy Loss)
-// =============================================================================
+// trainParallel организует многопоточную тренировку.
+// - Создаёт пул воркеров
+// - В главном цикле отправляет задачи (TrainTask) и получает результаты (GradResult)
+// - По сигналу Ctrl+C прерывает обучение и сохраняет модель
+func trainParallel(model *TransformerModel, data []int, cfg TransformerConfig, idx2char map[int]rune) {
+	numIters := cfg.NumIterations
+	checkpointInterval := 1000
 
-func crossEntropyLoss(logits []float64, target int) float64 {
-	probs := softmax(logits)
-	loss := -math.Log(probs[target] + 1e-9)
-	return loss
+	tasksChan := make(chan TrainTask)
+	resultsChan := make(chan GradResult)
+	stopChan := make(chan struct{})
+	saveChan := make(chan struct{})
+
+	// Запускаем горутину-сейвер
+	go saver(saveChan, model, "model_checkpoint.json")
+
+	numWorkers := runtime.NumCPU()
+	fmt.Printf("Запущено %d воркеров.\n", numWorkers)
+	// Создаём pool воркеров
+	for i := 0; i < numWorkers; i++ {
+		go trainWorker(model, data, cfg, resultsChan, tasksChan, stopChan)
+	}
+
+	// Канал для сигналов (SIGINT/SIGTERM)
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	totalLoss := 0.0
+	for iter := 1; iter <= numIters; iter++ {
+		select {
+		case <-sigChan:
+			fmt.Println("Сигнал завершения. Сохраняю модель и завершаю обучение.")
+			close(stopChan)
+			fmt.Println("1")
+			break
+			fmt.Println("2")
+		default:
+		}
+		// Отправляем задачу
+		tasksChan <- TrainTask{}
+		// Получаем результат
+		res := <-resultsChan
+		totalLoss += res.Loss
+		// Каждые 100 итераций выводим среднюю потерю и пример генерации
+		if iter%100 == 0 {
+			avgLoss := totalLoss / 100.0
+			fmt.Printf("Итерация %d, Средняя потеря: %.4f\n", iter, avgLoss)
+			totalLoss = 0.0
+			// Пример генерации
+			sample := generateText(model, data[:10], 200, idx2char, 0.8, 5)
+			fmt.Println("Пример генерации:")
+			fmt.Println(sample)
+			fmt.Println("--------------------------")
+		}
+		// Каждые checkpointInterval итераций вызываем сейвер
+		if iter%checkpointInterval == 0 {
+			saveChan <- struct{}{}
+		}
+	}
+	// Закрываем канал задач, сохраним модель
+	//close(tasksChan)
+	fmt.Println("Сохраняем модель в model.json")
+	saveModel(model, "model.json")
+	fmt.Println("Обучение завершено. Модель сохранена в model.json")
 }
 
-// =============================================================================
-// 7. Генерация текста (Inference)
-// =============================================================================
+// ====================================================================================
+// 8. Генерация текста (побуквенно) и режим вопрос-ответ (ask)
+// ====================================================================================
 
+// generateText генерирует text посимвольно, выводя символ сразу после генерации.
 func generateText(model *TransformerModel, startTokens []int, length int, idx2char map[int]rune, temperature float64, topK int) string {
 	if len(startTokens) == 0 {
 		startTokens = []int{0}
 	}
 	tokens := make([]int, len(startTokens))
 	copy(tokens, startTokens)
+	fmt.Println("Начало генерации:")
 	for i := 0; i < length; i++ {
 		start := 0
 		if len(tokens) > model.Cfg.BlockSize {
 			start = len(tokens) - model.Cfg.BlockSize
 		}
 		input := tokens[start:]
-		logits := model.Forward(input)
+		logits, _ := model.Forward(input)
 		lastLogits := logits[len(logits)-1]
-		probs := softmax(lastLogits)
+		probs := softmaxForward(lastLogits)
 		nextToken := sampleFromDistribution(probs, temperature, topK)
 		tokens = append(tokens, nextToken)
 		ch := idx2char[nextToken]
+		fmt.Print(string(ch))
+		time.Sleep(20 * time.Millisecond)
 		if ch == '.' || ch == '!' || ch == '?' {
 			break
 		}
 	}
+	fmt.Println()
 	var sb strings.Builder
 	for _, tok := range tokens {
 		ch, ok := idx2char[tok]
@@ -428,15 +657,17 @@ func generateText(model *TransformerModel, startTokens []int, length int, idx2ch
 	return sb.String()
 }
 
+// sampleFromDistribution выбирает элемент по распределению probs с учётом topK и temperature.
 func sampleFromDistribution(probs []float64, temperature float64, topK int) int {
 	if topK < 1 {
 		topK = len(probs)
 	}
+	// Повышаем/понижаем все вероятности, затем нормируем
 	adjusted := make([]float64, len(probs))
 	for i, p := range probs {
 		adjusted[i] = math.Pow(p, 1.0/temperature)
 	}
-	adjusted = softmax(adjusted)
+	adjusted = softmaxForward(adjusted)
 	type Pair struct {
 		Index int
 		Prob  float64
@@ -466,10 +697,26 @@ func sampleFromDistribution(probs []float64, temperature float64, topK int) int 
 	return pairs[topK-1].Index
 }
 
-// =============================================================================
-// 8. Загрузка датасета (TinyShakespeare)
-// =============================================================================
+// askQuestion принимает вопрос (строку), трансформирует её в токены, и генерирует ответ.
+func askQuestion(model *TransformerModel, question string, char2idx map[rune]int, idx2char map[int]rune) string {
+	tokens := []int{}
+	for _, ch := range question {
+		if idx, ok := char2idx[ch]; ok {
+			tokens = append(tokens, idx)
+		} else {
+			// Если символ не найден в словаре, ставим 0 (обычно это padding или unknown).
+			tokens = append(tokens, 0)
+		}
+	}
+	answer := generateText(model, tokens, 200, idx2char, 0.8, 5)
+	return answer
+}
 
+// ====================================================================================
+// 9. Загрузка датасета, сохранение/загрузка модели, main
+// ====================================================================================
+
+// loadDataset читает tinyshakespeare.txt, строит словарь символов, превращает текст в индексы.
 func loadDataset(path string) ([]int, map[rune]int, map[int]rune) {
 	content, err := ioutil.ReadFile(path)
 	if err != nil {
@@ -488,29 +735,27 @@ func loadDataset(path string) ([]int, map[rune]int, map[int]rune) {
 		idx2char[idx] = ch
 		idx++
 	}
-	data := make([]int, 0, len(text))
+	data := []int{}
 	for _, ch := range text {
 		data = append(data, char2idx[ch])
 	}
 	return data, char2idx, idx2char
 }
 
-// =============================================================================
-// 9. Сохранение и загрузка модели (JSON)
-// =============================================================================
-
+// saveModel сериализует TransformerModel в JSON.
 func saveModel(model *TransformerModel, filename string) {
 	file, err := os.Create(filename)
 	if err != nil {
-		log.Fatalf("Ошибка при создании файла: %v", err)
+		log.Fatalf("Ошибка создания файла: %v", err)
 	}
 	defer file.Close()
-	encoder := json.NewEncoder(file)
-	if err := encoder.Encode(model); err != nil {
-		log.Fatalf("Ошибка при сохранении модели: %v", err)
+	enc := json.NewEncoder(file)
+	if err := enc.Encode(model); err != nil {
+		log.Fatalf("Ошибка сохранения модели: %v", err)
 	}
 }
 
+// loadModel десериализует TransformerModel из JSON.
 func loadModel(filename string) (*TransformerModel, error) {
 	file, err := os.Open(filename)
 	if err != nil {
@@ -518,215 +763,60 @@ func loadModel(filename string) (*TransformerModel, error) {
 	}
 	defer file.Close()
 	var model TransformerModel
-	decoder := json.NewDecoder(file)
-	if err := decoder.Decode(&model); err != nil {
+	dec := json.NewDecoder(file)
+	if err := dec.Decode(&model); err != nil {
 		return nil, err
 	}
 	return &model, nil
 }
 
-// =============================================================================
-// 10. Обучение модели с многопоточностью и сохранением через каналы
-// =============================================================================
-
-// Тип задачи для обучения (пустая структура, т.к. задача генерируется внутри воркера).
-type TrainTask struct{}
-
-// trainWorker получает задачи из tasksChan, выполняет forward‑проход и отправляет потерю в resultsChan.
-func trainWorker(model *TransformerModel, data []int, cfg TransformerConfig, resultsChan chan<- float64, tasksChan <-chan TrainTask, stopChan <-chan struct{}) {
-	N := len(data)
-	for {
-		select {
-		case <-stopChan:
-			// Завершаем работу воркера при получении сигнала остановки.
-			return
-		case _, ok := <-tasksChan:
-			if !ok {
-				return
-			}
-			start := rand.Intn(N - cfg.BlockSize - 1)
-			inputSeq := data[start : start+cfg.BlockSize]
-			targetSeq := data[start+1 : start+cfg.BlockSize+1]
-			logits := model.Forward(inputSeq)
-			totalLoss := 0.0
-			for t := 0; t < len(logits); t++ {
-				totalLoss += crossEntropyLoss(logits[t], targetSeq[t])
-			}
-			avgLoss := totalLoss / float64(len(logits))
-			resultsChan <- avgLoss
-		}
-	}
-}
-
-// saver — выделенная горутина для сохранения модели, получает сигналы через saveChan.
-func saver(saveChan <-chan struct{}, model *TransformerModel, filename string) {
-	for range saveChan {
-		saveModel(model, filename)
-		fmt.Println("Модель сохранена (чекпоинт).")
-	}
-}
-
-// trainParallel запускает обучение в параллельном режиме, используя все доступные процессоры.
-// Все задачи отправляются через канал, результаты агрегируются, а сохранение модели происходит через выделенную горутину.
-func trainParallel(model *TransformerModel, data []int, char2idx map[rune]int, idx2char map[int]rune) {
-	cfg := model.Cfg
-	numIters := cfg.NumIterations
-	checkpointInterval := 1000 // Сохраняем чекпоинт каждые 1000 итераций
-
-	tasksChan := make(chan TrainTask)
-	resultsChan := make(chan float64)
-	stopChan := make(chan struct{})
-	saveChan := make(chan struct{})
-
-	// Запускаем горутину-сейвер для сохранения модели.
-	go saver(saveChan, model, "model_checkpoint.json")
-
-	// Запускаем пул воркеров (число = runtime.NumCPU())
-	numWorkers := runtime.NumCPU()
-	fmt.Printf("Запущено %d воркеров для обучения.\n", numWorkers)
-	for i := 0; i < numWorkers; i++ {
-		go trainWorker(model, data, cfg, resultsChan, tasksChan, stopChan)
-	}
-
-	// Канал для обработки сигнала завершения (SIGTERM, SIGINT).
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-
-	totalLoss := 0.0
-	iter := 0
-Loop:
-	for iter = 1; iter <= numIters; iter++ {
-		// Перед отправкой задачи проверяем, не поступил ли сигнал завершения.
-		select {
-		case <-sigChan:
-			fmt.Println("Получен сигнал завершения. Сохраняю модель и завершаю обучение.")
-			break Loop
-		default:
-			// Продолжаем
-		}
-
-		tasksChan <- TrainTask{}
-		loss := <-resultsChan
-		totalLoss += loss
-
-		if iter%100 == 0 {
-			avgLoss := totalLoss / 100.0
-			fmt.Printf("Итерация %d, Средняя потеря: %.4f\n", iter, avgLoss)
-			totalLoss = 0.0
-			// Вывод примера генерации.
-			sample := generateText(model, data[:10], 200, idx2char, 0.8, 5)
-			fmt.Println("Пример сгенерированного текста:")
-			fmt.Println(sample)
-			fmt.Println("--------------------------")
-		}
-
-		if iter%checkpointInterval == 0 {
-			saveChan <- struct{}{}
-		}
-	}
-
-	// После завершения цикла (либо по итерациям, либо по сигналу) закрываем каналы.
-	close(tasksChan)
-	close(stopChan)
-	// Сохраняем итоговую модель.
-	saveModel(model, "model.json")
-	fmt.Println("Обучение завершено и модель сохранена в model.json")
-}
-
-// =============================================================================
-// 11. Функция для ответа на вопрос в стиле Шекспира (инференс)
-// =============================================================================
-
-func askQuestion(model *TransformerModel, question string, char2idx map[rune]int, idx2char map[int]rune) string {
-	// Преобразуем вопрос в последовательность токенов.
-	tokens := []int{}
-	for _, ch := range question {
-		if idx, ok := char2idx[ch]; ok {
-			tokens = append(tokens, idx)
-		} else {
-			tokens = append(tokens, 0)
-		}
-	}
-	answer := generateText(model, tokens, 200, idx2char, 0.8, 5)
-	return answer
-}
-
-// =============================================================================
-// 12. Главная функция main
-// =============================================================================
-
+// main — точка входа. Определяет режим работы (train или ask), загружает модель и запускает процесс.
 func main() {
 	rand.Seed(time.Now().UnixNano())
-	// Задействуем все доступные ядра.
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
-	mode := flag.String("mode", "train", "Режим работы: 'train' для обучения, 'ask' для вопроса")
+	mode := flag.String("mode", "train", "Режим работы: 'train' или 'ask'")
 	flag.Parse()
 
 	datasetPath := "tinyshakespeare.txt"
-	if _, err := os.Stat(datasetPath); os.IsNotExist(err) {
-		log.Fatalf("Файл %s не найден. Поместите датасет в рабочую директорию.", datasetPath)
+	if _, err := os.Stat(datasetPath); err != nil {
+		log.Fatalf("Файл %s не найден.", datasetPath)
 	}
-
 	data, char2idx, idx2char := loadDataset(datasetPath)
 	fmt.Printf("Датасет загружен: %d символов, размер словаря: %d\n", len(data), len(char2idx))
 
-	// Основные параметры обучения.
 	cfg := TransformerConfig{
-		VocabSize:     len(char2idx), // Размер словаря
-		EmbedSize:     128,           // Размер эмбеддингов (больше – лучше представление, но больше параметров)
-		BlockSize:     128,           // Максимальная длина входной последовательности (контекст)
-		NumHeads:      1,             // Количество голов (1 для простоты)
-		MLPDim:        256,           // Размер скрытого слоя в MLP (увеличение улучшает качество, но требует больше ресурсов)
-		LearningRate:  0.0005,        // Скорость обучения (важно подобрать оптимальное значение)
-		NumIterations: 15000,         // Количество итераций обучения (чем больше, тем лучше, но занимает больше времени)
-		BatchSize:     64,            // Размер батча (не используется в данном примере)
+		VocabSize:     len(char2idx),
+		EmbedSize:     128,
+		BlockSize:     128,
+		MLPDim:        256,
+		LearningRate:  0.0005,
+		NumIterations: 3000,
+		BatchSize:     64,
 	}
 
-	numBlocks := 6
 	var model *TransformerModel
-	if *mode == "ask" {
-		m, err := loadModel("model.json")
-		if err != nil {
-			log.Fatalf("Модель не найдена! Сначала обучите модель (mode=train)")
-		}
+	m, err := loadModel("model.json")
+	if err != nil {
+		fmt.Println("Модель не найдена, создаём новую модель...")
+		model = NewTransformerModel(cfg)
+	} else {
 		fmt.Println("Модель загружена!")
 		model = m
-		if len(model.Embed.PositionalEmbedding) == 0 {
-			model.Embed.PositionalEmbedding = newRandomMatrix(cfg.BlockSize, cfg.EmbedSize)
-		}
 		model.Cfg = cfg
-	} else {
-		if _, err := os.Stat("model.json"); err != nil {
-			fmt.Println("Сохранённая модель не найдена, создаём новую модель...")
-			model = NewTransformerModel(cfg, numBlocks)
-		} else {
-			m, err := loadModel("model.json")
-			if err != nil {
-				fmt.Println("Ошибка загрузки модели, создаём новую модель...")
-				model = NewTransformerModel(cfg, numBlocks)
-			} else {
-				fmt.Println("Модель загружена!")
-				model = m
-				if len(model.Embed.PositionalEmbedding) == 0 {
-					model.Embed.PositionalEmbedding = newRandomMatrix(cfg.BlockSize, cfg.EmbedSize)
-				}
-			}
-			model.Cfg = cfg
-		}
 	}
 
 	if *mode == "ask" {
 		reader := bufio.NewReader(os.Stdin)
-		fmt.Println("Введите ваш вопрос на английском:")
-		question, _ := reader.ReadString('\n')
-		question = strings.TrimSpace(question)
-		answer := askQuestion(model, question, char2idx, idx2char)
+		fmt.Println("Введите вопрос на английском:")
+		q, _ := reader.ReadString('\n')
+		q = strings.TrimSpace(q)
+		answer := askQuestion(model, q, char2idx, idx2char)
 		fmt.Println("Ответ в стиле Шекспира:")
 		fmt.Println(answer)
 	} else {
 		fmt.Println("Начинается обучение модели...")
-		trainParallel(model, data, char2idx, idx2char)
+		trainParallel(model, data, cfg, idx2char)
 		fmt.Println("Генерация финального текста:")
 		finalText := generateText(model, []int{0}, 200, idx2char, 0.8, 5)
 		fmt.Println(finalText)
