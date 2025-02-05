@@ -282,17 +282,17 @@ next_token = argmax(softmax) = 3 ("o")
 
 ### 5. Как использовать
 
-1. Скопируйте файл `transformer_full.go` в свою папку.  
+1. Скопируйте файл `gpt.go` в свою папку.  
 2. Поместите `tinyshakespeare.txt` рядом.  
 3. Запустите обучение:
    ```bash
-   go run transformer_full.go -mode=train
+   go run gpt.go -mode=train
    ```
    Будет выводиться средняя потеря каждые 100 итераций.  
 4. Когда обучение прервётся (Ctrl+C) или закончится (число итераций), модель сохранится в `model.json`.  
 5. Запустите в режиме `ask`:
    ```bash
-   go run transformer_full.go -mode=ask
+   go run gpt.go -mode=ask
    ```
    Введите вопрос (например, «What is love?»). Модель выведет ответ посимвольно.
 
